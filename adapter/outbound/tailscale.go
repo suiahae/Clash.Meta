@@ -25,6 +25,7 @@ import (
 	"github.com/metacubex/tailscale/envknob"
 	"github.com/metacubex/tailscale/hostinfo"
 	"github.com/metacubex/tailscale/ipn"
+	"github.com/metacubex/tailscale/ipn/ipnstate"
 	"github.com/metacubex/tailscale/net/netmon"
 	"github.com/metacubex/tailscale/tailcfg"
 	"github.com/metacubex/tailscale/tsnet"
@@ -41,12 +42,16 @@ type Tailscale struct {
 	cancel      context.CancelFunc
 	startOnce   sync.Once
 	startErr    error
+	startedAt   time.Time
 
 	backendInitOnce sync.Once
 	backendInitCh   chan struct{}
 	backendInitErr  error
 
 	serverStarted bool
+
+	lastErrMu sync.Mutex
+	lastErr   string
 
 	unregisterDNSResolver func()
 }
@@ -198,6 +203,7 @@ func (t *Tailscale) start() error {
 			t.setBackendInitialized(err)
 			return
 		}
+		t.startedAt = time.Now()
 		go t.watchBackendState()
 	})
 	return t.startErr
@@ -210,6 +216,7 @@ func (t *Tailscale) ensureStarted(ctx context.Context) error {
 	return t.waitBackendInitialized(ctx)
 }
 
+// The watcher runs for the outbound's lifetime: it feeds the last error and reapplies the exit node on each Running.
 func (t *Tailscale) watchBackendState() {
 	lc, err := t.server.LocalClient()
 	if err != nil {
@@ -223,32 +230,101 @@ func (t *Tailscale) watchBackendState() {
 	}
 	defer watcher.Close()
 
-	backendInitialized := false
 	exitNodeNeedsStatus := tailscaleExitNodeNeedsStatus(t.option)
+	exitNodeApplied := !exitNodeNeedsStatus
+	running := false
 	for {
 		n, err := watcher.Next()
 		if err != nil {
+			t.setLastError(err.Error())
 			t.setBackendInitialized(err)
 			return
 		}
-		if n.State == nil {
+		if n.ErrMessage != nil {
+			t.setLastError(*n.ErrMessage)
+		}
+		if n.State != nil {
+			if *n.State != ipn.NoState {
+				t.setBackendInitialized(nil)
+			}
+			running = *n.State == ipn.Running
+			if running {
+				t.setLastError("")
+			}
+		}
+		if !running || exitNodeApplied {
 			continue
 		}
-
-		if *n.State != ipn.NoState && !backendInitialized {
-			t.setBackendInitialized(nil)
-			backendInitialized = true
-			if !exitNodeNeedsStatus {
-				return
-			}
-		}
-		if exitNodeNeedsStatus && *n.State == ipn.Running {
-			if err := t.applyExitNodePrefs(t.ctx); err != nil {
-				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
-			}
-			return
+		// The peer may appear only after the first Running notification.
+		if err := t.applyExitNodePrefs(t.ctx); err != nil {
+			log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
+			t.setLastError(err.Error())
+		} else {
+			exitNodeApplied = true
 		}
 	}
+}
+
+func (t *Tailscale) setLastError(message string) {
+	t.lastErrMu.Lock()
+	t.lastErr = message
+	t.lastErrMu.Unlock()
+}
+
+func (t *Tailscale) TailscaleLastError() string {
+	t.lastErrMu.Lock()
+	defer t.lastErrMu.Unlock()
+	return t.lastErr
+}
+
+// TailscaleStatus starts the backend on first use and reports its state.
+func (t *Tailscale) TailscaleStatus(ctx context.Context) (*ipnstate.Status, error) {
+	if err := t.ensureStarted(ctx); err != nil {
+		return nil, err
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	return lc.Status(ctx)
+}
+
+// TailscaleStartLogin begins an interactive login; the auth URL arrives in the status.
+func (t *Tailscale) TailscaleStartLogin(ctx context.Context) error {
+	if err := t.ensureStarted(ctx); err != nil {
+		return err
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return err
+	}
+	if err := lc.StartLoginInteractive(ctx); err != nil {
+		return err
+	}
+	t.setLastError("")
+	return nil
+}
+
+func (t *Tailscale) TailscaleLogout(ctx context.Context) error {
+	if err := t.ensureStarted(ctx); err != nil {
+		return err
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return err
+	}
+	if err := lc.Logout(ctx); err != nil {
+		return err
+	}
+	t.setLastError("")
+	return nil
+}
+
+func (t *Tailscale) TailscaleDial(ctx context.Context, network, address string) (net.Conn, error) {
+	if err := t.ensureStarted(ctx); err != nil {
+		return nil, err
+	}
+	return t.server.Dial(ctx, network, address)
 }
 
 func (t *Tailscale) setBackendInitialized(err error) {
@@ -416,6 +492,12 @@ func (t *Tailscale) ResolveUDP(ctx context.Context, metadata *C.Metadata) error 
 	return nil
 }
 
+const (
+	tailscaleDNSWarmup   = time.Minute
+	tailscaleDNSRetry    = 500 * time.Millisecond
+	tailscaleDNSRetryMax = 10
+)
+
 type tailscaleDNSTransport struct {
 	tailscale *Tailscale
 }
@@ -442,16 +524,30 @@ func (t tailscaleDNSTransport) ExchangeContext(ctx context.Context, msg *D.Msg) 
 	if err != nil {
 		return nil, err
 	}
-	response, _, err := lc.QueryDNS(ctx, q.Name, qtypeName)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		response, _, err := lc.QueryDNS(ctx, q.Name, qtypeName)
+		if err != nil {
+			return nil, err
+		}
+		var responseMsg D.Msg
+		if err = responseMsg.Unpack(response); err != nil {
+			return nil, err
+		}
+		// MagicDNS names come from the netmap, which is still filling in just
+		// after start; an answer there is cached as a missing name.
+		if responseMsg.Rcode != D.RcodeNameError || attempt >= tailscaleDNSRetryMax ||
+			time.Since(t.tailscale.startedAt) >= tailscaleDNSWarmup {
+			responseMsg.Id = msg.Id
+			return &responseMsg, nil
+		}
+		select {
+		case <-time.After(tailscaleDNSRetry):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-t.tailscale.ctx.Done():
+			return nil, t.tailscale.ctx.Err()
+		}
 	}
-	var responseMsg D.Msg
-	if err = responseMsg.Unpack(response); err != nil {
-		return nil, err
-	}
-	responseMsg.Id = msg.Id
-	return &responseMsg, nil
 }
 
 func (t *Tailscale) ProxyInfo() C.ProxyInfo {
