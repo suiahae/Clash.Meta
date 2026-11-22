@@ -415,3 +415,12 @@ func NewAutoCloseProxyAdapter(adapter ProxyAdapter) ProxyAdapter {
 	runtime.SetFinalizer(proxy, (*autoCloseProxyAdapter).Close)
 	return proxy
 }
+
+// A parsed outbound is wrapped so its connections keep it alive; callers that
+// need the outbound's own methods reach it through here.
+func UnwrapProxyAdapter(adapter C.ProxyAdapter) C.ProxyAdapter {
+	if wrapper, ok := adapter.(*autoCloseProxyAdapter); ok {
+		return wrapper.ProxyAdapter
+	}
+	return adapter
+}
